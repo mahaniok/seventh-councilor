@@ -107,8 +107,8 @@ def main():
     latent_demand = extract_mc_latent_demand(gs, fid)
     mc = extract_mc_full(gs, fid, hi, factions,
                          mining_cost=latent_demand['mine_network_cost'])
-    mc['mc_nations'] = extract_control_points(gs, factions)['earth_mc_by_faction'].get(
-        args.faction, 0)
+    from extract_snapshot import extract_nation_mc_share
+    mc['mc_nations'] = extract_nation_mc_share(gs, fid)   # per-CP split = the tooltip's nations line
     available = (mc['mc_hq'] + mc['mc_councilors'] + mc['mc_nations']
                  + mc['mc_hab_produced'])
     used = mc['mc_used_reported']
@@ -218,7 +218,7 @@ def render(o, args):
     print(f"\n# Base fix audit — {o['faction']} — {o['date']}\n")
     print(f"## MC headline\n")
     print(f"Available {m['available']} · used {m['used']} · **slack {m['slack']:+}** "
-          f"(reconstruction reads ~7 optimistic — the in-game top bar is truth); "
+          f"(reconstruction — the in-game top bar is truth); "
           f"pending from in-flight modules {m['pending_from_inflight_modules']:+}.")
     print(f"{m['mines_active']} active mines, {m['mines_building']} under construction → "
           f"**~+{m['latent_mining_mc_when_they_land']} MC of latent demand** when they land "

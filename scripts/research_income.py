@@ -93,12 +93,32 @@ def _load_templates_extra():
     return out
 
 
+def _parse_version(s):
+    """'1.0.63' -> (1, 0, 63); anything unparseable -> (0,) so it compares as oldest."""
+    try:
+        return tuple(int(p) for p in str(s or '').split('.'))
+    except ValueError:
+        return (0,)
+
+
 class SaveResearch:
     """One loaded save; computes research incomes for any faction in it."""
 
-    def __init__(self, save_path):
-        self.gs = er.load_save(save_path)['gamestates']
+    def __init__(self, save_path=None, gs=None):
+        """From a save path, or from an already-loaded `gamestates` dict (the extractor
+        passes its own so the 60-90 MB save isn't parsed twice)."""
+        self.gs = gs if gs is not None else er.load_save(save_path)['gamestates']
         gs = self.gs
+        self.save_version = _parse_version(next(
+            (g.get('latestSaveVersion') for _, g in er.kv_items(gs, _NS + 'TIGlobalValuesState')), ''))
+        # Councilor research = Σ org/trait incomeResearch × (1 + effective Science/100) was
+        # code-verified on 1.0.39 and still matches a 1.0.62 base-game save to 0.4%. On a
+        # 1.0.63 2003-scenario save the tooltip matches the UNSCALED sum instead (454/mo flat
+        # vs 535/mo scaled; scaled over-read the 🧪 tooltip by 11%, flat hit it to 0.1%).
+        # Build or scenario — not yet separable; this is only the DEFAULT. breakdown() then
+        # checks both models against the faction's booked ledger research and switches when
+        # the other one is clearly closer, so a wrong default self-corrects (R29).
+        self.councilor_science_scales = self.save_version < (1, 0, 63)
         self.date, _ = er.get_game_date(gs)
         self.nations = dict(er.kv_items(gs, _NS + 'TINationState'))
         self.regions = dict(er.kv_items(gs, _NS + 'TIRegionState'))
@@ -165,7 +185,17 @@ class SaveResearch:
                 if er.deref(entry.get('Key')) != fid:
                     continue
                 for en in ((entry.get('Value') or {}).get('ControlPointResearch') or []):
-                    op, v = self.extra['cp_res_effects'].get(en, ('Additive', 0.0))
+                    if en not in self.extra['cp_res_effects']:
+                        # An effect the save applies but the templates mirror doesn't
+                        # know is almost always a missing LAYER (DLC scenario overlay or a
+                        # mod — e.g. the 2003 start's Effect_BS_CPResearchPenalty, ×0.5).
+                        # Treating it as "no effect" silently mis-states research, so say so.
+                        print(f"WARNING: research effect {en!r} is active on this faction but "
+                              f"absent from the templates mirror — assuming no effect. Re-run "
+                              f"setup_campaign.py / sync_game_data.py (scenario + mods layers).",
+                              file=sys.stderr)
+                        continue
+                    op, v = self.extra['cp_res_effects'][en]
                     if op == 'Multiplicative':
                         mult *= v
                     else:
@@ -204,7 +234,11 @@ class SaveResearch:
     def hq_income_day(self, fac):
         return ((fac.get('baseIncomes_year') or {}).get('Research', 0) or 0) / DAYS_YR
 
-    def councilor_income_month(self, fac):
+    def councilor_income_month(self, fac, scaled=None):
+        """Σ org + trait incomeResearch per councilor (not detained); `scaled` applies the
+        pre-1.0.63 ×(1 + Science/100) multiplier (default: the save-version rule)."""
+        if scaled is None:
+            scaled = self.councilor_science_scales
         total = 0.0
         for cid in (er.deref(c) for c in (fac.get('councilors') or [])):
             c = self.councilors.get(cid, {}) or {}
@@ -215,8 +249,18 @@ class SaveResearch:
             base += sum(self.extra['trait_res'].get(tn, 0)
                         for tn in (c.get('traitTemplateNames') or []))
             if base > 0:
-                total += base * (1.0 + self.eff_science(cid) / 100.0)
+                if scaled:
+                    base *= (1.0 + self.eff_science(cid) / 100.0)
+                total += base
         return total
+
+    def booked_research_day(self, fac):
+        """The game's own booked daily research from the faction's Transactions ledger
+        (`Daily Income` / Research, newest entry) — GROUND TRUTH for the pre-distribution
+        base, one day stale. 0.0 when the ledger is absent (alien faction, very old saves)."""
+        di = (fac.get('Transactions') or {}).get('Daily Income') or []
+        booked = [e.get('Amount', 0) for e in di if e.get('Resource') == 'Research']
+        return booked[-1] if booked else 0.0
 
     def hab_income_month(self, fid):
         mri = self.templates.get('module_research_income', {})
@@ -234,18 +278,7 @@ class SaveResearch:
         """(maxMC, usedMC). max = HQ+councilor+hab+nation MC; used = reported demand."""
         hab_inv = er.extract_hab_inventory(self.gs, fid)
         mc = er.extract_mc_full(self.gs, fid, hab_inv, self.factions)
-        nation_mc = 0
-        for cp in self.cps.values():
-            if er.fac_id_from_field(cp.get('faction')) != fid or cp.get('benefitsDisabled'):
-                continue
-            n = self.nations[er.deref(cp.get('nation'))]
-            cur = sum((self.regions.get(er.deref(r), {}) or {}).get('missionControl', 0) or 0
-                      for r in (n.get('regions') or []))
-            ncp = max(n.get('numControlPoints') or 1, 1)
-            share = cur // ncp
-            if (cp.get('positionInNation') or 0) >= ncp - (cur % ncp):
-                share += 1
-            nation_mc += share
+        nation_mc = er.extract_nation_mc_share(self.gs, fid)   # per-CP split, shared with the extractor
         max_mc = (mc.get('mc_hq', 0) or 0) + (mc.get('mc_councilors', 0) or 0) \
                  + (mc.get('mc_hab_produced', 0) or 0) + nation_mc
         return max_mc, (mc.get('mc_used_reported', 0) or 0)
@@ -267,7 +300,6 @@ class SaveResearch:
         fac = self.factions[fid]
         rows, nations_mo = self.nations_income(fid)
         hq_day = self.hq_income_day(fac)
-        counc_day = self.councilor_income_month(fac) * 12 / DAYS_YR
         habs_day = self.hab_income_month(fid) * 12 / DAYS_YR
         nations_day = nations_mo * 12 / DAYS_YR
         mc_day = 0.0
@@ -275,18 +307,44 @@ class SaveResearch:
             max_mc, used_mc = self.mission_control(fid)
             mc_day = max(0, max_mc - used_mc) * EXCESS_MC_RESEARCH_DAY
         dist_pct = self.distribution_pct(fac)
-        base_day = hq_day + counc_day + nations_day + habs_day + mc_day
+        booked_day = self.booked_research_day(fac)
+        # Councilor term: the save-version rule picks scaled (pre-1.0.63) vs flat, then the
+        # ledger — the game's own booked pre-distribution base — arbitrates. If the OTHER
+        # model lands clearly closer to the ledger (by more than 1% of the base), use it and
+        # say so: this self-calibrates across builds, scenarios and code mods instead of
+        # trusting a hard-coded patch threshold (R29).
+        counc_scaled = self.councilor_income_month(fac, scaled=True) * 12 / DAYS_YR
+        counc_flat = self.councilor_income_month(fac, scaled=False) * 12 / DAYS_YR
+        rest_day = hq_day + nations_day + habs_day + mc_day
+        by_model = {'scaled': counc_scaled, 'flat': counc_flat}
+        default = 'scaled' if self.councilor_science_scales else 'flat'
+        counc_model = default
+        counc_note = f"{counc_model} (save version {'.'.join(map(str, self.save_version))})"
+        if booked_day > 0 and abs(counc_scaled - counc_flat) > 1e-9:
+            err = {m: abs(rest_day + v - booked_day) for m, v in by_model.items()}
+            other = 'flat' if default == 'scaled' else 'scaled'
+            if err[other] < err[default] - 0.01 * booked_day:
+                counc_model = other
+                counc_note = (f"{counc_model} — LEDGER-CALIBRATED: the save-version default "
+                              f"({default}) missed the booked {booked_day:.2f}/day by "
+                              f"{err[default]:.2f}, this one by {err[other]:.2f}; pin the build "
+                              f"in LESSONS-research R29")
+        counc_day = by_model[counc_model]
+        base_day = rest_day + counc_day
         total_day = base_day * (1 + dist_pct)
-        # actually-booked daily research from the transactions ledger (save ground truth)
-        di = (fac.get('Transactions') or {}).get('Daily Income') or []
-        booked = [e.get('Amount', 0) for e in di if e.get('Resource') == 'Research']
         return {
             'date': self.date, 'faction': faction_template,
             'hq_day': hq_day, 'councilors_day': counc_day, 'nations_day': nations_day,
             'habs_day': habs_day, 'unused_mc_day': mc_day, 'dist_pct': dist_pct,
             'dist_day': base_day * dist_pct, 'total_day': total_day,
             'total_month': total_day * MO, 'nations_month': nations_mo,
-            'nation_rows': rows, 'booked_day': booked[-1] if booked else 0.0,
+            'nation_rows': rows, 'booked_day': booked_day,
+            'councilor_model': counc_model, 'councilor_model_note': counc_note,
+            # Ledger-anchored total: the game's booked base × (1 + distribution). For RIVALS
+            # this is the number to quote (it IS their Intel-screen research, one day stale);
+            # the formula reconstruction above is the explanation of it, not a better value.
+            'ledger_total_day': (booked_day * (1 + dist_pct)) if booked_day > 0 else None,
+            'ledger_total_month': (booked_day * (1 + dist_pct) * MO) if booked_day > 0 else None,
         }
 
 
@@ -331,6 +389,7 @@ def main():
     print(f"  TOTAL        {fmt_day(b['total_day'])}   [in-game 🧪 tooltip figure]")
     print(f"  (booked in ledger: {b['booked_day']:.1f}/day — excludes the distribution "
           f"bonus & any same-day changes)")
+    print(f"  councilor model: {b['councilor_model_note']}")
 
     print(f"\n  --- per-nation research (what {a.faction} receives) ---")
     print(f"  {'nation':24s} {'research/mo':>11s} {'CPs':>7s} {'KS':>3s} {'→ player/mo':>12s} {'/day':>7s}")
@@ -342,16 +401,20 @@ def main():
     # rival columns for Table H, in the order HF,Init,Serv,Prot,Acad,Exod
     rival_computed = None
     if a.all_factions:
-        print("\n  --- rival factions (computed; Intel shows monthly research) ---")
+        print("\n  --- rival factions: LEDGER = their booked base × distribution (what Intel shows, "
+              "1 day stale); formula = the reconstruction explaining it ---")
         rival_computed = []
         for ftmpl in ('DestroyCouncil', 'ExploitCouncil', 'SubmitCouncil',
                       'AppeaseCouncil', 'CooperateCouncil', 'EscapeCouncil'):
             try:
-                rb = sr.breakdown(ftmpl, with_mc=False)
-                rival_computed.append(f"{rb['total_day'] * MO:,.0f}")
-                print(f"  {ftmpl:17s} {rb['total_day'] * MO:9.0f}/mo  "
-                      f"(nations {rb['nations_month']:7.0f}, counc {rb['councilors_day'] * MO:6.0f}, "
-                      f"habs {rb['habs_day'] * MO:6.0f}, dist {rb['dist_pct']:.0%})")
+                rb = sr.breakdown(ftmpl, with_mc=True)
+                quoted = rb['ledger_total_month'] if rb['ledger_total_month'] else rb['total_day'] * MO
+                rival_computed.append(f"{quoted:,.0f}")
+                src = 'ledger' if rb['ledger_total_month'] else 'formula'
+                print(f"  {ftmpl:17s} {quoted:9.0f}/mo [{src}]  formula {rb['total_day'] * MO:7.0f} "
+                      f"(nations {rb['nations_month']:6.0f}, counc {rb['councilors_day'] * MO:5.0f}, "
+                      f"habs {rb['habs_day'] * MO:4.0f}, MC {rb['unused_mc_day'] * MO:4.0f}, "
+                      f"dist {rb['dist_pct']:.0%})")
             except Exception as ex:
                 rival_computed.append('?')
                 print(f"  {ftmpl:17s} — {ex}")

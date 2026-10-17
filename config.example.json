@@ -20,5 +20,11 @@
   "_alien_progression_help": "Your campaign's alien-progression setting. Scripts read the live value from your save; this copy is a fallback and a hint for the AI agent's reasoning (event timing, hate math).",
 
   "difficulty": "Normal",
-  "_difficulty_help": "Cinematic, Normal, Veteran, or Brutal. Scripts read difficulty from your save; this copy is a fallback and a hint for the AI agent's reasoning (several constants are difficulty-keyed)."
+  "_difficulty_help": "Cinematic, Normal, Veteran, or Brutal. Scripts read difficulty from your save; this copy is a fallback and a hint for the AI agent's reasoning (several constants are difficulty-keyed).",
+
+  "scenario": null,
+  "_scenario_help": "DLC scenario overlay your campaign runs on: \"2003_Scenario\" (Dark Skies 2003 start) or \"Broken_Earth_Scenario\"; null = default 2026 start. setup_campaign.py detects it from the save. sync_game_data.py layers <install>/DLC_Content/<DLC>/<scenario>/Templates over the base templates — without it, scenario-only effects (e.g. the 2003 start's x0.5 CP research penalty) are invisible to the analyzers.",
+
+  "mods": "enabled",
+  "_mods_help": "Which mods sync_game_data.py layers onto the templates: \"enabled\" = everything in <install>/Mods/Enabled (what the game actually loads), a list of mod folder names, or false for none. Only template-file mods (TI*Template.json, TIGlobalConfig.json, *.en) affect the analyzers; code (.dll) mods cannot be mirrored."
 }

@@ -174,7 +174,8 @@ rule `ReduceFleetMCConsumption`) = **×0.8 on its whole FLEET**. So `ship_mc = �
 × 0.85^techstacks × 0.8^has_FlagBridge )`; detect Flag Bridge via the design's
 `moduleTemplateEntries[].moduleName == 'FlagBridge'`. Summing the raw field over-counts ~24%
 (176 vs 142) and used to poison the ships/habs split. With this + the powered-filter fix (E25),
-ships **and** habs both match the game (141/572 vs 142/571); only nations remains ~+7 (E25 TODO).
+ships **and** habs both match the game (141/572 vs 142/571); nations was the last ~+7 error until
+the per-CP split landed (E25, 2026-10-17).
 
 ## E20 — For ANY mine-output number, run `mine_completion_timeline.py`
 
@@ -224,9 +225,14 @@ boost).
 Only `missionControlUsage` and the mining quadratic are exact. The 2033-03-01 ground truth:
 game slack +4, reconstructed slack +49 — which produced "you're ~5 over" advice when the
 player was ~50 over. Root cause fixed (available summed UNPOWERED producers — the
-powered-filter rule, P1.4); hab-produced is now exact and remaining error ≈ +7 (nations not
-ownership-weighted, small TODO). Even post-fix: to answer "am I over MC / by how much", read
-the in-game top bar/tooltip or ask — don't quote the reconstruction's slack as fact.
+powered-filter rule, P1.4); hab-produced is now exact. The last ≈ +7 (nations) was fixed
+2026-10-17: a nation's regional MC is split **per control point** — each CP gets
+`total // numControlPoints`, the remainder goes to the highest `positionInNation` CPs, and
+crackdown (`benefitsDisabled`) CPs get nothing — so a majority holder does NOT get the whole
+nation (save-verified 2006-07-16: per-CP split 22 = in-game 27 − HQ 2 − orgs 3; the
+majority-nation sum gave 30). `extract_nation_mc_share()` is the one implementation; every
+MC tool uses it. Even post-fix: to answer "am I over MC / by how much", read the in-game top
+bar/tooltip or ask — don't quote the reconstruction's slack as fact.
 
 ## E26 (new 2026-07-04) — Over MC cap = your habs can be MUTINIED away (Control Space Asset)
 

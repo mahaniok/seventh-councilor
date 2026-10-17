@@ -84,11 +84,12 @@ already extracts the field.
 | `fetch_ladder.py`                                                                 | Fetch drive/reactor ladder data                                                                                                                                                                |
 | `ti_war_editor.py`                                                                | Save-EDITING (opt-in, MUTATES the save): add belligerents to an EXISTING war — both alliance arrays + every participant's enemy list; backs up + self-validates (§ Save editing below; P15/C13)                                                                                                                |
 | `nation_report.py <nation> [saves…\|--scan G [--watch N2]] [--recovery]` | Nation scorecard / two-save diff (annexation before-vs-after audits — COMPLETE set incl. cohesion/unrest rest states) / multi-save scan for event bisection. `--recovery` projects research+IP at cohesion recovery (×rest/current) + a timing ETA from the observed cohesion rate (LESSONS-politics C18/C19/C20/C21) |
+| `cp_holders.py [save] [--filter DEU,FRA,…] [--held] [--min-gdp T] [--json]`      | Earth control-point MAP, nation by nation: every nation's seats, who holds each (crackdown-suppressed marked `!`), your ideology's opinion share, cohesion→rest, federation lead, and the per-seat cap cost — "in THIS set of countries, who is in the way and where are the open seats?" (theatre sizing before a Control Nation push; the extractor only tallies per faction) |
 | `opinion_trajectory.py <nation> <saves…\|--glob P>`                               | Public opinion trends AND crash forensics: per-save ideology table + who ran Propaganda on whom (bisect a step-drop to its day, then attribute — LESSONS-politics C15) |
 | `tech_contributions.py <save1> <save2> …[--tech X]`                               | Global-tech race standings (who controls each next queue pick) + windfall forensics: flags per-faction jumps and names the mechanic from the Transactions ledger (e.g. Steal Project) |
 | `ops_query.py [--theater X] [--ship-name Y] [--section …]`                        | One-command military sitrep: fleets/transits, councilor missions, theater drill-down, construction geography, alien order of battle                                                                                                                                               |
 | `setup_campaign.py [save] [--dry-run]`                                            | First-run setup: detect faction/difficulty/rates from the save, write config.json, mirror game data |
-| `sync_game_data.py`                                                               | Mirror templates/localization from the local install (run at setup + after patches)                                                                                                            |
+| `sync_game_data.py [--scenario X] [--no-mods] [--dry-run]`                        | Build the templates/localization mirror as LAYERS — base game + DLC scenario overlay (`config.scenario`) + enabled mods (`config.mods`); provenance in `scripts/templates/_LAYERS.json` (run at setup, after patches, after changing mods) |
 | `generate_vault.py` / `generate_modules.py`                                       | Generate per-tech / per-module reference pages into `generated/`                                                                                                                               |
 
 ## Lessons library (read the relevant file BEFORE working in its domain)
@@ -166,8 +167,14 @@ Read `config.json` before quoting numbers: research-rate scales all RP costs; di
 keys several constants (e.g. alien hate floor per MC: Cinematic 0.05 / Normal 0.3 /
 Veteran 0.6 / Brutal 1.0). `income_display` (`"month"` default | `"day"`) sets the ONE unit
 for every income you present — match it, never show yearly, never mix units (LESSONS-process
-P17). Formulas here were calibrated on build 1.0.38 — on a newer build, re-verify before
-leaning on a calibration (see `docs/setup.md` § Patch drift).
+P17). `scenario` + `mods` name the game-data LAYERS the templates mirror is built from: a DLC
+scenario (Dark Skies `2003_Scenario` / `Broken_Earth_Scenario`) overlays its own techs,
+projects and `Effect_BS_*` penalties on the base game, and enabled mods overlay theirs — an
+effect the save applies but the mirror lacks reads as "no effect" (LESSONS-process P18). When
+a number disagrees with the game, check `scripts/templates/_LAYERS.json` first. Formulas here
+were calibrated on build 1.0.38 — on a newer build, re-verify before leaning on a calibration
+(see `docs/setup.md` § Patch drift; known 1.0.63 change: councilor research no longer scales
+with Science, LESSONS-research).
 
 ## Campaign workspace — read it, and keep it current
 
