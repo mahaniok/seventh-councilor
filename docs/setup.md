@@ -46,12 +46,29 @@ Edit `config.json`:
 python3 scripts/sync_game_data.py
 ```
 
-This copies the game's template JSONs and English localization from **your** install into
+This builds the game's template JSONs and English localization from **your** install into
 `scripts/templates/` and `scripts/localization/` (both gitignored). The analyzers use them to
 translate internal names to the names you see in-game and to read module/drive/tech stats.
 
+The mirror is built the way the game builds its own data — in **layers**, later ones
+overriding earlier ones per `dataName`:
+
+1. the base game (`TerraInvicta_Data/StreamingAssets/Templates`);
+2. the DLC **scenario overlay** your campaign runs on (`config.json` → `"scenario"`:
+   `"2003_Scenario"` for the Dark Skies 2003 start, `"Broken_Earth_Scenario"`, or `null`
+   for the default 2026 start — `setup_campaign.py` detects it from the save). Scenario-only
+   content lives *only* there: the 2003 start's `BS_*` techs, `Project_BS_*` projects and the
+   `Effect_BS_*` penalties (e.g. ×0.5 control-point research). Without this layer those
+   effects are invisible to the analyzers and research reads ~30% high;
+3. the **mods** the game has enabled (`<install>/Mods/Enabled/*`; `config.json` → `"mods"`:
+   `"enabled"`, a list of folder names, or `false`). Only template-file mods matter here —
+   code (`.dll`) mods can't be mirrored, so their effects stay unmodelled.
+
+`scripts/templates/_LAYERS.json` records which layers built each file. Check it when a
+number disagrees with the game: a missing layer is the first suspect.
+
 This repo intentionally ships no game data — it's Pavonis Interactive's. Mirroring locally
-also means the data always matches *your* game version, mods included.
+also means the data always matches *your* game version, scenario and mods.
 
 **Re-run this after every game patch** and after enabling/disabling mods.
 

@@ -31,7 +31,17 @@ _DEFAULTS = {
     "research_rate_pct": 100,
     "alien_progression_pct": 100,
     "difficulty": "Normal",
+    # Game-data LAYERS the templates mirror is built from (sync_game_data.py):
+    #   scenario: DLC scenario overlay folder under <install>/DLC_Content/*/, e.g.
+    #             "2003_Scenario" (Dark Skies 2003 start) or "Broken_Earth_Scenario";
+    #             None = default 2026 start, no overlay. setup_campaign.py detects it.
+    #   mods:     "enabled" = every mod in <install>/Mods/Enabled (what the game loads),
+    #             a list of mod folder names, or false for none.
+    "scenario": None,
+    "mods": "enabled",
 }
+
+SCENARIOS = ("2003_Scenario", "Broken_Earth_Scenario")
 
 _FACTIONS = [
     "ResistCouncil", "ExploitCouncil", "SubmitCouncil", "AppeaseCouncil",
@@ -50,6 +60,11 @@ def _load_config() -> dict:
         for k in _DEFAULTS:
             if user.get(k) is not None:
                 cfg[k] = user[k]
+        if cfg["scenario"] is not None and cfg["scenario"] not in SCENARIOS:
+            raise SystemExit(
+                f"config.json: unknown scenario {cfg['scenario']!r}. "
+                f"Valid values: {', '.join(SCENARIOS)} or null"
+            )
         if cfg["faction"] is not None and cfg["faction"] not in _FACTIONS:
             raise SystemExit(
                 f"config.json: unknown faction {cfg['faction']!r}. "
@@ -149,6 +164,76 @@ def _candidate_install_dirs() -> list[Path]:
             cands.append(drive / "Games" / "Steam" / "steamapps" / "common"
                          / "Terra Invicta")
     return cands
+
+
+def find_install_dir() -> Path | None:
+    """The game install root (config first, then auto-detect)."""
+    roots = []
+    if CONFIG["game_install_dir"]:
+        roots.append(Path(os.path.expanduser(CONFIG["game_install_dir"])))
+    roots += _candidate_install_dirs()
+    for root in roots:
+        if (root / "TerraInvicta_Data" / "StreamingAssets" / "Templates").is_dir():
+            return root
+    return None
+
+
+def scenario_dirs(scenario: str | None = None, install: Path | None = None) -> tuple[Path | None, Path | None]:
+    """(templates overlay dir, English localization overlay dir) for a DLC scenario.
+
+    Dark Skies ships its scenarios as template OVERLAYS that the game layers on top of
+    StreamingAssets/Templates: <install>/DLC_Content/<DLC>/<scenario>/Templates and
+    <install>/DLC_Content/<DLC>/Localization/en/<scenario with spaces>/. Entries there
+    override the base game per dataName (e.g. the 2003 start's `Effect_BS_*` penalties,
+    `BS_*` techs) — a mirror of the base folder alone silently misses all of it.
+    """
+    scenario = scenario if scenario is not None else CONFIG["scenario"]
+    install = install or find_install_dir()
+    if not scenario or not install:
+        return None, None
+    dlc_root = install / "DLC_Content"
+    if not dlc_root.is_dir():
+        return None, None
+    for dlc in sorted(dlc_root.iterdir()):
+        t = dlc / scenario / "Templates"
+        if t.is_dir():
+            loc = dlc / "Localization" / "en" / scenario.replace("_", " ")
+            return t, (loc if loc.is_dir() else None)
+    return None, None
+
+
+def dlc_localization_dirs(install: Path | None = None) -> list[Path]:
+    """Top-level English localization folders of every installed DLC (shared strings)."""
+    install = install or find_install_dir()
+    if not install or not (install / "DLC_Content").is_dir():
+        return []
+    out = []
+    for dlc in sorted((install / "DLC_Content").iterdir()):
+        loc = dlc / "Localization" / "en"
+        if loc.is_dir():
+            out.append(loc)
+    return out
+
+
+def enabled_mod_dirs(install: Path | None = None) -> list[Path]:
+    """Mod folders the game loads, per config `mods`: "enabled" → <install>/Mods/Enabled/*
+    (the game copies every enabled mod there), a list → those names under Mods/Enabled
+    (then Mods/Disabled), false/None → none. Alphabetical — the game's own load order
+    isn't recorded on disk, so overlapping mods are a best effort (reported by the sync)."""
+    mods = CONFIG["mods"]
+    install = install or find_install_dir()
+    if not mods or not install:
+        return []
+    enabled = install / "Mods" / "Enabled"
+    if mods == "enabled":
+        return sorted(p for p in enabled.iterdir() if p.is_dir()) if enabled.is_dir() else []
+    out = []
+    for name in mods:
+        for base in (enabled, install / "Mods" / "Disabled"):
+            if (base / name).is_dir():
+                out.append(base / name)
+                break
+    return out
 
 
 def find_templates_dir() -> Path | None:

@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """Sync Terra Invicta game data (templates + English localization) into this repo.
 
-Copies ALL template JSONs and all English .en localization files from the local
-game install into the local mirror next to the scripts, but FIRST prints a
-content-level drift report:
+Builds the local mirror the scripts read (scripts/templates, scripts/localization) the
+way the GAME builds its own template set — as LAYERS, later layers overriding earlier
+ones per `dataName`:
 
-  * Template JSONs are parsed and compared per-dataName entry:
-    added / removed / changed entries (with the changed top-level keys and a
-    compact old -> new value preview).
-  * .en localization files get a line-level summary (added / removed lines,
-    with a few examples).
+  1. base game      <install>/TerraInvicta_Data/StreamingAssets/Templates (+ Localization/en)
+  2. DLC scenario   <install>/DLC_Content/<DLC>/<scenario>/Templates      (config "scenario";
+                    e.g. Dark Skies "2003_Scenario" — its `Effect_BS_*` penalties, `BS_*`
+                    techs and `Project_BS_*` projects exist ONLY here)
+  3. enabled mods   <install>/Mods/Enabled/*/TI*Template.json             (config "mods")
+
+A mirror of layer 1 alone is silently wrong for a scenario or modded campaign: unknown
+effect names fall back to "no effect" in the analyzers (the 2003 start's ×0.5 CP research
+penalty read as ×1.0 — research over-read by 30%). Provenance of every merged file is
+written to scripts/templates/_LAYERS.json.
+
+Before copying, prints a content-level DRIFT report (merged install data vs the mirror):
+  * Template JSONs compared per-dataName entry: added / removed / changed entries.
+  * .en localization files get a line-level summary.
   * Files present only in the source (never mirrored before) are reported as NEW.
 
 Usage:
-    python3 sync_game_data.py                 # report drift, then copy
-    python3 sync_game_data.py --dry-run       # report drift only, copy nothing
+    python3 sync_game_data.py                 # report drift, then write the merged mirror
+    python3 sync_game_data.py --dry-run       # report drift only, write nothing
+    python3 sync_game_data.py --scenario 2003_Scenario   # override config "scenario"
+    python3 sync_game_data.py --no-mods       # base + scenario only
     python3 sync_game_data.py \
         --src-templates /path/to/Templates \
         --src-localization /path/to/Localization/en \
@@ -22,43 +33,29 @@ Usage:
         --dst-localization /path/to/localization
 
 Defaults (no CLI args needed when auto-detection works):
-    source templates    = <game install>/TerraInvicta_Data/StreamingAssets/Templates
-                          (from config.json "game_install_dir", else auto-detected
-                          via ti_config across Windows/macOS/Linux/WSL)
-    source localization = .../StreamingAssets/Localization/en
+    game install        = config.json "game_install_dir", else auto-detected via ti_config
     dest   templates    = scripts/templates      (next to this script)
     dest   localization = scripts/localization
 """
 import argparse
 import json
-import shutil
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from ti_config import CONFIG, _candidate_install_dirs
+from ti_config import (CONFIG, SCENARIOS, find_install_dir, scenario_dirs,
+                       dlc_localization_dirs, enabled_mod_dirs)
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 
-
-def _find_game_streaming_assets() -> Path | None:
-    """StreamingAssets dir of the game install (config first, then auto-detect)."""
-    import os
-    roots = []
-    if CONFIG["game_install_dir"]:
-        roots.append(Path(os.path.expanduser(CONFIG["game_install_dir"])))
-    roots += _candidate_install_dirs()
-    for root in roots:
-        sa = root / "TerraInvicta_Data" / "StreamingAssets"
-        if (sa / "Templates").is_dir():
-            return sa
-    return None
-
-
-_GAME_SA = _find_game_streaming_assets()
+_INSTALL = find_install_dir()
+_GAME_SA = (_INSTALL / "TerraInvicta_Data" / "StreamingAssets") if _INSTALL else None
 DEFAULT_SRC_TEMPLATES = (_GAME_SA / "Templates") if _GAME_SA else None
 DEFAULT_SRC_LOCAL = (_GAME_SA / "Localization" / "en") if _GAME_SA else None
 DEFAULT_DST_TEMPLATES = _SCRIPTS_DIR / "templates"
 DEFAULT_DST_LOCAL = _SCRIPTS_DIR / "localization"
+LAYERS_FILE = "_LAYERS.json"
 
 PREVIEW_LEN = 110
 MAX_EXAMPLES = 12
@@ -71,8 +68,21 @@ def compact(v) -> str:
     return s
 
 
+_COMMENT_RE = re.compile(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', re.DOTALL)
+_TRAILING_COMMA_RE = re.compile(r',(\s*[}\]])')
+
+
 def load_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    """Parse a template JSON. TIGlobalConfig.json (base game AND the DLC scenario
+    overlays) is JSON-with-comments (`// …` and `/* … */`) and may carry trailing
+    commas — strip both, outside strings."""
+    text = path.read_text(encoding="utf-8-sig")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        text = _COMMENT_RE.sub(lambda m: m.group(1) or "", text)
+        text = _TRAILING_COMMA_RE.sub(r"\1", text)
+        return json.loads(text)
 
 
 def index_by_dataname(data):
@@ -87,14 +97,120 @@ def index_by_dataname(data):
     return idx, True
 
 
-def diff_json_file(src: Path, dst: Path) -> bool:
-    """Print drift for one template JSON. Returns True if any content drift."""
-    name = src.name
-    try:
-        s_data = load_json(src)
-    except Exception as ex:
-        print(f"  !! {name}: source unparseable ({ex}) — will copy verbatim")
-        return True
+# ---------------------------------------------------------------------------
+# Layer merging
+# ---------------------------------------------------------------------------
+
+def merge_template(base, overlay, name: str, report: list) -> object:
+    """Merge one overlay file onto the base data of the same name, game-style:
+    per-dataName override/append for template lists; key-wise merge for
+    TIGlobalConfig ([{…}] with a single config dict); overlay wins otherwise."""
+    if base is None:
+        return overlay
+    if name.startswith("TIGlobalConfig"):
+        # One dict (dataName "globalConfig") — overlays carry only the keys they change,
+        # so merge KEY-wise; a per-dataName replace would drop every other constant.
+        b = base[0] if isinstance(base, list) and base else (base if isinstance(base, dict) else {})
+        o = overlay[0] if isinstance(overlay, list) and overlay else (overlay if isinstance(overlay, dict) else {})
+        changed = [k for k in o if b.get(k) != o.get(k)]
+        merged = dict(b)
+        merged.update(o)
+        report.append(f"{name}: {len(changed)} config keys overridden "
+                      f"({', '.join(changed[:6])}{', …' if len(changed) > 6 else ''})")
+        return [merged] if isinstance(base, list) else merged
+    b_idx, b_ok = index_by_dataname(base)
+    o_idx, o_ok = index_by_dataname(overlay)
+    if b_ok and o_ok:
+        merged = {k: v for k, v in b_idx.items()}
+        n_over = sum(1 for k in o_idx if k in b_idx)
+        merged.update(o_idx)
+        report.append(f"{name}: {len(o_idx)} entries ({n_over} override, {len(o_idx) - n_over} new)")
+        return list(merged.values())
+    report.append(f"{name}: whole-file replace (not a per-dataName file)")
+    return overlay
+
+
+def collect_layers(src_templates: Path, src_local: Path | None, scenario: str | None,
+                   use_mods: bool):
+    """Ordered list of layers: dicts with kind/name/templates dir/localization dirs."""
+    layers = [{"kind": "base", "name": "StreamingAssets", "templates": src_templates,
+               "localization": [src_local] if src_local else []}]
+    for loc in dlc_localization_dirs(_INSTALL):
+        # DLC-wide strings (shared by all its scenarios) ride along with the base layer
+        layers[0]["localization"].append(loc)
+    if scenario:
+        t, loc = scenario_dirs(scenario, _INSTALL)
+        if t is None:
+            sys.exit(f"ERROR: scenario {scenario!r} not found under {_INSTALL / 'DLC_Content' if _INSTALL else '<install>'} "
+                     f"— is the DLC installed? Valid names: {', '.join(SCENARIOS)}")
+        layers.append({"kind": "scenario", "name": scenario, "templates": t,
+                       "localization": [loc] if loc else []})
+    if use_mods:
+        for mdir in enabled_mod_dirs(_INSTALL):
+            if any(mdir.glob("TI*.json")) or any(mdir.glob("*.en")):
+                layers.append({"kind": "mod", "name": mdir.name, "templates": mdir,
+                               "localization": [mdir]})
+    return layers
+
+
+def build_merged_templates(layers):
+    """{filename: merged data}, plus a provenance record per file."""
+    merged, prov, notes = {}, {}, []
+    for layer in layers:
+        for src in sorted(layer["templates"].glob("TI*.json")):
+            try:
+                data = load_json(src)
+            except Exception as ex:
+                notes.append(f"  !! {layer['name']}/{src.name}: unparseable ({ex}) — skipped")
+                continue
+            if src.name in merged:
+                rep = []
+                merged[src.name] = merge_template(merged[src.name], data, src.name, rep)
+                notes.append(f"  {layer['kind']:8s} {layer['name']}: " + "; ".join(rep))
+            else:
+                merged[src.name] = data
+                if layer["kind"] != "base":
+                    notes.append(f"  {layer['kind']:8s} {layer['name']}: {src.name}: new file")
+            prov.setdefault(src.name, []).append(f"{layer['kind']}:{layer['name']}")
+    return merged, prov, notes
+
+
+def _en_lines(path: Path):
+    return path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+
+
+def build_merged_localization(layers):
+    """{filename: text}. Keyed lines (`KEY=value`) from later layers override earlier
+    ones in place; new keys append; unkeyed lines are kept from the first layer."""
+    merged, prov = {}, {}
+    for layer in layers:
+        for ldir in layer["localization"]:
+            for src in sorted(ldir.glob("*.en")):
+                lines = _en_lines(src)
+                if src.name not in merged:
+                    merged[src.name] = lines
+                else:
+                    cur = merged[src.name]
+                    pos = {ln.partition("=")[0]: i for i, ln in enumerate(cur) if "=" in ln}
+                    for ln in lines:
+                        if "=" not in ln:
+                            continue
+                        k = ln.partition("=")[0]
+                        if k in pos:
+                            cur[pos[k]] = ln
+                        else:
+                            pos[k] = len(cur)
+                            cur.append(ln)
+                prov.setdefault(src.name, []).append(f"{layer['kind']}:{layer['name']}")
+    return {k: "\n".join(v) + "\n" for k, v in merged.items()}, prov
+
+
+# ---------------------------------------------------------------------------
+# Drift reporting (merged install data vs the local mirror)
+# ---------------------------------------------------------------------------
+
+def diff_json_data(name: str, s_data, dst: Path) -> bool:
+    """Print drift for one template file. Returns True if any content drift."""
     if not dst.exists():
         n = len(s_data) if isinstance(s_data, list) else 1
         print(f"  ++ {name}: NEW (not previously mirrored) — {n} entries")
@@ -119,10 +235,7 @@ def diff_json_file(src: Path, dst: Path) -> bool:
     changed = []
     for k in s_idx:
         if k in d_idx and s_idx[k] != d_idx[k]:
-            keys = sorted(
-                set(s_idx[k]) | set(d_idx[k]),
-                key=lambda kk: kk,
-            )
+            keys = sorted(set(s_idx[k]) | set(d_idx[k]))
             ck = [kk for kk in keys if s_idx[k].get(kk) != d_idx[k].get(kk)]
             changed.append((k, ck))
 
@@ -150,10 +263,8 @@ def diff_json_file(src: Path, dst: Path) -> bool:
     return True
 
 
-def diff_en_file(src: Path, dst: Path) -> bool:
+def diff_en_text(name: str, s_text: str, dst: Path) -> bool:
     """Line-level summary for a .en localization file. Returns True on drift."""
-    name = src.name
-    s_text = src.read_text(encoding="utf-8-sig", errors="replace")
     if not dst.exists():
         n = sum(1 for ln in s_text.splitlines() if "=" in ln)
         print(f"  ++ {name}: NEW (not previously mirrored) — ~{n} tagged lines")
@@ -179,16 +290,22 @@ def diff_en_file(src: Path, dst: Path) -> bool:
     return True
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src-templates", type=Path, default=DEFAULT_SRC_TEMPLATES)
     ap.add_argument("--src-localization", type=Path, default=DEFAULT_SRC_LOCAL)
     ap.add_argument("--dst-templates", type=Path, default=DEFAULT_DST_TEMPLATES)
     ap.add_argument("--dst-localization", type=Path, default=DEFAULT_DST_LOCAL)
+    ap.add_argument("--scenario", default=CONFIG["scenario"],
+                    help=f"DLC scenario overlay ({', '.join(SCENARIOS)}); default from config.json")
+    ap.add_argument("--no-mods", action="store_true",
+                    help="ignore <install>/Mods/Enabled even if config 'mods' is set")
     ap.add_argument("--dry-run", action="store_true",
-                    help="print the drift report but copy nothing")
-    args = ap.parse_args()
+                    help="print the drift report but write nothing")
+    args = ap.parse_args(argv)
+    if args.scenario in ("", "none", "null"):
+        args.scenario = None
 
     for p, label in [(args.src_templates, "source templates"),
                      (args.src_localization, "source localization")]:
@@ -199,57 +316,84 @@ def main():
         if not p.is_dir():
             sys.exit(f"ERROR: {label} dir not found: {p}")
 
-    src_jsons = sorted(args.src_templates.glob("*.json"))
-    src_ens = sorted(args.src_localization.glob("*.en"))
+    global _INSTALL
+    if _INSTALL is None:
+        # --src-templates given by hand: the install root is 3 levels up from
+        # <install>/TerraInvicta_Data/StreamingAssets/Templates (DLC + mods hang off it).
+        cand = args.src_templates.resolve().parent.parent.parent
+        if (cand / "TerraInvicta_Data").is_dir():
+            _INSTALL = cand
+    layers = collect_layers(args.src_templates, args.src_localization, args.scenario,
+                            use_mods=not args.no_mods and bool(CONFIG["mods"]))
 
     print("=" * 72)
-    print("DRIFT REPORT — game install vs local mirror")
-    print(f"  templates:    {args.src_templates}")
-    print(f"            →   {args.dst_templates}")
-    print(f"  localization: {args.src_localization}")
-    print(f"            →   {args.dst_localization}")
+    print("GAME-DATA LAYERS (later overrides earlier, per dataName)")
+    for i, layer in enumerate(layers, 1):
+        print(f"  {i}. {layer['kind']:8s} {layer['name']}  ← {layer['templates']}")
+    if not args.scenario:
+        print("  (no DLC scenario overlay — config \"scenario\" is null; the default 2026 start)")
     print("=" * 72)
 
-    print(f"\n--- Templates ({len(src_jsons)} JSON files in install) ---")
+    merged_t, prov_t, notes = build_merged_templates(layers)
+    merged_l, prov_l = build_merged_localization(layers)
+    if notes:
+        print("\n--- Overlay merge ---")
+        for n in notes:
+            print(n)
+
+    print(f"\n--- DRIFT: merged install data vs local mirror ({len(merged_t)} template files) ---")
+    print(f"  mirror: {args.dst_templates}")
     t_drift = 0
-    for src in src_jsons:
-        if diff_json_file(src, args.dst_templates / src.name):
+    for name in sorted(merged_t):
+        if diff_json_data(name, merged_t[name], args.dst_templates / name):
             t_drift += 1
     print(f"  => {t_drift} template file(s) with drift, "
-          f"{len(src_jsons) - t_drift} identical at content level.")
+          f"{len(merged_t) - t_drift} identical at content level.")
 
-    # Mirror-only template files (would become stale orphans)
     if args.dst_templates.is_dir():
         orphans = sorted(set(p.name for p in args.dst_templates.glob("*.json"))
-                         - set(p.name for p in src_jsons))
+                         - set(merged_t) - {LAYERS_FILE})
         for o in orphans:
             print(f"  ?? {o}: present in local mirror but NOT in install (left untouched)")
 
-    print(f"\n--- Localization ({len(src_ens)} .en files in install) ---")
+    print(f"\n--- Localization ({len(merged_l)} .en files) ---")
     l_drift = 0
-    for src in src_ens:
-        if diff_en_file(src, args.dst_localization / src.name):
+    for name in sorted(merged_l):
+        if diff_en_text(name, merged_l[name], args.dst_localization / name):
             l_drift += 1
     print(f"  => {l_drift} .en file(s) with drift, "
-          f"{len(src_ens) - l_drift} byte-identical.")
+          f"{len(merged_l) - l_drift} byte-identical.")
     if args.dst_localization.is_dir():
         orphans = sorted(set(p.name for p in args.dst_localization.glob("*.en"))
-                         - set(p.name for p in src_ens))
+                         - set(merged_l))
         for o in orphans:
             print(f"  ?? {o}: present in local mirror but NOT in install (left untouched)")
 
     if args.dry_run:
-        print("\n--dry-run: nothing copied.")
+        print("\n--dry-run: nothing written.")
         return
 
-    print("\n--- Copying ---")
+    print("\n--- Writing merged mirror ---")
     args.dst_templates.mkdir(parents=True, exist_ok=True)
     args.dst_localization.mkdir(parents=True, exist_ok=True)
-    for src in src_jsons:
-        shutil.copy2(src, args.dst_templates / src.name)
-    for src in src_ens:
-        shutil.copy2(src, args.dst_localization / src.name)
-    print(f"Copied {len(src_jsons)} template JSONs and {len(src_ens)} .en files.")
+    for name, data in merged_t.items():
+        (args.dst_templates / name).write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    for name, text in merged_l.items():
+        (args.dst_localization / name).write_text(text, encoding="utf-8")
+    provenance = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "install": str(_INSTALL) if _INSTALL else None,
+        "scenario": args.scenario,
+        "layers": [{"kind": l["kind"], "name": l["name"], "templates": str(l["templates"])}
+                   for l in layers],
+        "templates": prov_t,
+        "localization": prov_l,
+    }
+    (args.dst_templates / LAYERS_FILE).write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {len(merged_t)} template JSONs and {len(merged_l)} .en files "
+          f"({len(layers)} layers; provenance in {LAYERS_FILE}).")
 
 
 if __name__ == "__main__":

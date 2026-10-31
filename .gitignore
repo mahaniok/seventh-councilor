@@ -25,3 +25,5 @@ campaign/*
 
 # Machine-local Claude instructions (per-user, never committed)
 CLAUDE.local.md
+
+.idea

@@ -1607,11 +1607,25 @@ def extract_cp_cap(gs, faction_id, factions):
                 continue
             for e in fe.get('Value', {}).get('ControlPointMaintenance', []) or []:
                 bonus_effects[e] += 1
-    # Parse the effect names like Effect_ControlPointMaintenanceBonus40
+    # Value each effect from the template (ControlPointMaintenance context, Additive:
+    # NEGATIVE value = cap bonus, e.g. Effect_ControlPointMaintenanceBonus40 = -40, the
+    # 2003 scenario's Effect_BS_CPMaintenancePenalty = +40). Falling back to the digits
+    # in the name is wrong in both directions: `…Bonus160` is actually -120 and the
+    # un-numbered `…Penalty` / `…MakingHistoryA` effects (+40 / -60) read as 0.
+    effect_values = {}
+    tdir = find_templates_dir()
+    if tdir:
+        for e in _safe_load_json(os.path.join(tdir, 'TIEffectTemplate.json')) or []:
+            if 'ControlPointMaintenance' in (e.get('contexts') or []):
+                effect_values[e.get('dataName')] = (e.get('operation', 'Additive'), e.get('value', 0) or 0)
     bonus_total = 0
     for effect_name, c in bonus_effects.items():
-        # Extract trailing digits
-        m = ''.join(ch for ch in effect_name if ch.isdigit())
+        if effect_name in effect_values:
+            op, v = effect_values[effect_name]
+            if op == 'Additive':
+                bonus_total += -v * c
+            continue
+        m = ''.join(ch for ch in effect_name if ch.isdigit())   # template missing: old heuristic
         if m:
             bonus_total += int(m) * c
 
@@ -1652,6 +1666,37 @@ def extract_cp_cap(gs, faction_id, factions):
         'cp_load': cp_load,
         'cp_load_crackdown_excluded': cp_load_crackdown_excluded,
     }
+
+
+def extract_nation_mc_share(gs, faction_id):
+    """Nation-side Mission Control the faction actually receives — the tooltip's
+    "nations" line. Each nation's regional `missionControl` total is split ACROSS its
+    control points: every CP gets `total // numControlPoints`, and the remainder goes
+    to the highest-positioned CPs (`positionInNation >= numCP - remainder`). Crackdown
+    CPs (`benefitsDisabled`) get nothing. Summing a majority nation's whole total
+    (the old "majority-of-filled-CPs" shortcut) over-reads for every nation you don't
+    hold outright — a 3/4-CP Russia read 8 instead of 6, and a 1/3-CP Poland 4 instead
+    of 1 (save-verified 2006-07: this split gives 22 = the in-game 27 − HQ 2 − orgs 3;
+    the shortcut gave 30)."""
+    nations = dict(kv_items(gs, 'PavonisInteractive.TerraInvicta.TINationState'))
+    regions = dict(kv_items(gs, 'PavonisInteractive.TerraInvicta.TIRegionState'))
+    nation_mc_total = {}
+    total = 0
+    for cid, cp in kv_items(gs, 'PavonisInteractive.TerraInvicta.TIControlPoint'):
+        if fac_id_from_field(cp.get('faction')) != faction_id or cp.get('benefitsDisabled'):
+            continue
+        nid = deref(cp.get('nation'))
+        n = nations.get(nid) or {}
+        if nid not in nation_mc_total:
+            nation_mc_total[nid] = sum((regions.get(deref(r)) or {}).get('missionControl', 0) or 0
+                                       for r in (n.get('regions') or []))
+        cur = nation_mc_total[nid]
+        ncp = max(n.get('numControlPoints') or 1, 1)
+        share = cur // ncp
+        if (cp.get('positionInNation') or 0) >= ncp - (cur % ncp):
+            share += 1
+        total += share
+    return total
 
 
 def extract_mc_full(gs, faction_id, hab_inv, factions, mining_cost=None):
@@ -1799,21 +1844,40 @@ def extract_leo_slot_capacity(gs, faction_id):
             continue
         if not hv.get('inEarthLEO'):
             continue
+        # A hab's TISectorState list is pre-allocated for EVERY tier (5 sectors on a
+        # brand-new T1 platform); only sectors with `faction` set are open — the rest
+        # unlock with core upgrades. Count open sectors only, and report MODULE slots
+        # the way the hab screen does: the core occupies a slot of its own, so a T1
+        # station = 4 buildable slots (save-verified 2006-07, a T1 platform read
+        # 21 slots / 16 empty while the game showed 4 / 0).
+        hab_sectors = sectors_by_hab.get(hid, [])
+
+        def _modules(sv):
+            for mref in (sv.get('habModules') or []):
+                m = modules_by_id.get(deref(mref))
+                if m and (m.get('templateName') or '').strip():
+                    yield m
+
+        # Open = the game has assigned the sector a faction, or something is built in it.
+        # If NO sector qualifies (older save schema without the field), fall back to all.
+        open_sectors = [(sid, sv) for sid, sv in hab_sectors
+                        if sv.get('faction') is not None or any(True for _ in _modules(sv))]
+        if not open_sectors:
+            open_sectors = hab_sectors
         slots = 0
         built = 0
         underway = 0
-        for sid, sv in sectors_by_hab.get(hid, []):
+        for sid, sv in open_sectors:
             slots += sv.get('slots', 0) or 0
-            for mref in (sv.get('habModules') or []):
-                mid = deref(mref)
-                m = modules_by_id.get(mid)
-                if not m or not (m.get('templateName') or '').strip():
+            for m in _modules(sv):
+                if (m.get('templateName') or '').endswith('Core'):
+                    slots -= 1          # the core's own slot is not buildable space
                     continue
                 if m.get('constructionCompleted'):
                     built += 1
                 else:
                     underway += 1
-        empty = slots - built - underway
+        empty = max(0, slots - built - underway)
         rows.append({
             'hab': hv.get('displayName') or hv.get('templateName') or '?',
             'tier': hv.get('tier'),
@@ -4614,15 +4678,24 @@ def format_markdown(snapshot, brief=False):
         habs = s['habs_by_faction'].get(tpl, 0)
         cps = s['cps_by_faction'].get(tpl, 0)
         flag = ' **(you)**' if tpl == s['player_template'] else ''
-        L.append(f"| {f['name']}{flag} | {fmt_amount(per_unit(f['research_yr']))} | "
+        live = f.get('research_live_day')
+        research_cell = (fmt_amount(per_unit(live * 365.2421875)) if live is not None
+                         else fmt_amount(per_unit(f['research_yr'])) + ' *')
+        L.append(f"| {f['name']}{flag} | {research_cell} | "
                  f"{fmt_amount(per_unit(f['money_yr']))} | {fmt_amount(per_unit(f['boost_yr']))} | "
                  f"{fmt_amount(per_unit(f['ops_yr']))} | {fmt_amount(per_unit(f['mc_yr']))} | "
                  f"{habs} | {fleet.get('ships', 0)} | "
                  f"{fleet.get('total_mass_kg', 0)/1e6:.0f} | {cps} |")
     L.append("")
-    L.append(f"> **Note**: the Research column above is `cachedYearlyRevenue.Research` shown "
-             f"{su} — stale-cached (rough ±15% for rivals, often ~2× off for the player). "
-             "See \"Research income breakdown\" below for the canonical live formula.")
+    if any(f.get('research_live_day') is not None for f in s['faction_comparison']):
+        L.append(f"> **Note**: Research{su} is the LIVE model from `research_income.py` (the player's "
+                 f"row matches the 🧪 tooltip; rival rows are the same formula on their CPs/orgs — "
+                 f"what their Intel screen shows). Rows marked `*` fell back to the stale "
+                 f"`cachedYearlyRevenue` cache. Money/Boost/Ops/MC are still the cache.")
+    else:
+        L.append(f"> **Note**: the Research column above is `cachedYearlyRevenue.Research` shown "
+                 f"{su} — stale-cached (rough ±15% for rivals, often ~2× off for the player). "
+                 "See \"Research income breakdown\" below for the canonical live formula.")
     L.append("")
 
     # -- Rival faction full stockpiles --
@@ -4652,27 +4725,44 @@ def format_markdown(snapshot, brief=False):
     # -- Research income breakdown (6-source canonical formula) --
     ri = s.get('research_income') or {}
     if ri:
+        exact = ri.get('model') == 'exact'
         L.append("## Research income breakdown (canonical 6-source formula)")
-        L.append("Matches the in-game 🧪 tooltip on the top resource bar. Validated "
-                 "to the daily decimal on the 2032-04-28 save (1+26.5+180.3+31.2+5.7 "
-                 "= 244.7 × 1.30 = 318.1/day → 9.7K/mo). The breakdown "
-                 "is reconstructed from primary save data; flagged components are "
-                 "heuristics (councilors, Advise direct boost, MC cap).")
+        if exact:
+            L.append("Matches the in-game 🧪 tooltip on the top resource bar — the code-verified "
+                     "model from `research_income.py` (nation research formula, org/trait councilor "
+                     "incomes, template-valued ControlPointResearch effects incl. scenario/mod layers, "
+                     "per-slot distribution bonus). Validated to 0.1% on 2033-02/04 (1.0.39) and "
+                     "2006-07-16 (1.0.63, 2003 scenario) saves.")
+        else:
+            L.append("Matches the in-game 🧪 tooltip on the top resource bar. Validated "
+                     "to the daily decimal on the 2032-04-28 save (1+26.5+180.3+31.2+5.7 "
+                     "= 244.7 × 1.30 = 318.1/day → 9.7K/mo). The breakdown "
+                     "is reconstructed from primary save data; flagged components are "
+                     "heuristics (councilors, Advise direct boost, MC cap)."
+                     + (f" **Exact model unavailable: {ri['model_error']}**" if ri.get('model_error') else ""))
         L.append("")
         L.append("| Source | Daily | Monthly | Note |")
         L.append("|---|---:|---:|---|")
         L.append(f"| 1. Faction HQ | {ri['hq_per_day']:.2f} | "
                  f"{ri['hq_per_day']*30.44:.0f} | exact, from `baseIncomes_year.Research/365.25` |")
-        L.append(f"| 2. Councilors (est.) | {ri['councilors_per_day_estimate']:.2f} | "
-                 f"{ri['councilors_per_day_estimate']*30.44:.0f} | heuristic: "
-                 f"{ri['councilors_count']} councilors × ~4/each + Sci total "
-                 f"{ri['councilor_science_total']} × ~0.5 |")
-        L.append(f"| 3a. Nations (CP-share) | {ri['nation_cp_share_per_day']:.2f} | "
-                 f"{ri['nation_cp_share_per_day']*30.44:.0f} | exact: Σ over my CPs of "
-                 f"(N.historyResearch[0] × ownership_share) |")
-        L.append(f"| 3b. Advise direct boost | {ri['advise_direct_per_day']:.2f} | "
-                 f"{ri['advise_direct_per_day']*30.44:.0f} | heuristic: Σ adviser Sci+Cmd+Adm × 0.18 "
-                 f"with 1/(n+1) diminishing returns per nation |")
+        if exact:
+            L.append(f"| 2. Councilors | {ri['councilors_per_day_estimate']:.2f} | "
+                     f"{ri['councilors_per_day_estimate']*30.44:.0f} | exact: Σ org + trait "
+                     f"`incomeResearch` over {ri['councilors_count']} councilors (not detained) |")
+            L.append(f"| 3. Nations (CP-share) | {ri['nation_cp_share_per_day']:.2f} | "
+                     f"{ri['nation_cp_share_per_day']*30.44:.0f} | exact: Σ my CPs of "
+                     f"research_month × KS × CP-research effects / numCPs (advisers inside) |")
+        else:
+            L.append(f"| 2. Councilors (est.) | {ri['councilors_per_day_estimate']:.2f} | "
+                     f"{ri['councilors_per_day_estimate']*30.44:.0f} | heuristic: "
+                     f"{ri['councilors_count']} councilors × ~4/each + Sci total "
+                     f"{ri['councilor_science_total']} × ~0.5 |")
+            L.append(f"| 3a. Nations (CP-share) | {ri['nation_cp_share_per_day']:.2f} | "
+                     f"{ri['nation_cp_share_per_day']*30.44:.0f} | exact: Σ over my CPs of "
+                     f"(N.historyResearch[0] × ownership_share) |")
+            L.append(f"| 3b. Advise direct boost | {ri['advise_direct_per_day']:.2f} | "
+                     f"{ri['advise_direct_per_day']*30.44:.0f} | heuristic: Σ adviser Sci+Cmd+Adm × 0.18 "
+                     f"with 1/(n+1) diminishing returns per nation |")
         L.append(f"| 4. Habs | {ri['habs_per_day']:.2f} | "
                  f"{ri['habs_per_month']:.0f} | exact: Σ over {ri['hab_modules_with_research']} "
                  f"powered+completed research modules via TIHabModuleTemplate.json |")
@@ -4687,7 +4777,10 @@ def format_markdown(snapshot, brief=False):
         L.append(f"| Subtotal (base) | **{ri['base_sources_per_day']:.2f}** | "
                  f"{ri['base_sources_per_day']*30.44:.0f} | sum of 1-5 |")
         L.append(f"| 6. Distribution bonus | {ri['dist_bonus_per_day']:.2f} | "
-                 f"{ri['dist_bonus_per_day']*30.44:.0f} | ×{int(ri['dist_bonus_pct']*100)}% tech-gated bonus on subtotal |")
+                 f"{ri['dist_bonus_per_day']*30.44:.0f} | "
+                 + (f"+{round(ri['dist_bonus_pct']*100)}% = 5% per research slot with weight > 0 |"
+                    if exact else
+                    f"×{int(ri['dist_bonus_pct']*100)}% tech-gated bonus on subtotal |"))
         L.append(f"| **TOTAL** | **{ri['total_per_day']:.1f}** | "
                  f"**{ri['total_per_month']:.0f}** | "
                  f"matches the in-game 🧪 tooltip |")
@@ -4771,15 +4864,13 @@ def format_markdown(snapshot, brief=False):
              f"**FIXED 2026-07-04:** hab-produced now counts only POWERED MC modules (was counting"
              f" built-but-unpowered — 30 idle AdminTowers + 2 OpsCenters = +38 phantom MC), so"
              f" hab-produced now matches the game exactly (352). **Total used (`missionControlUsage`),"
-             f" mining (quadratic), and hab-produced are now exact.** Remaining small error: nations"
-             f" reads ~+7 high (does not weight by ownership share — e.g. North Korea held 1/2 CPs"
-             f" should give ~50% of its MC; TODO). So available/slack now over-read only ~7 MC — much"
-             f" better than the old ~45, but for the precise over/under-cap number still trust the"
-             f" in-game top bar.*")
+             f" mining (quadratic), hab-produced and nations are now exact** — nations is the per-CP"
+             f" split of each nation's regional MC (crackdown CPs excluded; fixed 2026-10-17, the old"
+             f" majority-nation sum over-read partially-held nations by ~7-8). For the precise"
+             f" over/under-cap number still trust the in-game top bar.*")
     L.append("")
     L.append(f"**Visible slack: {mc_available - mc['mc_used_reported']:.0f}**  "
-             f"(now ~7 MC optimistic — nations over-reads ~7 for partial-ownership nations; "
-             f"good enough for a gut check, but read the in-game MC tooltip for the exact figure)")
+             f"(reconstruction; read the in-game MC tooltip for the exact figure)")
     L.append(f"Pending net change when in-flight modules finish: **{mc['mc_pending_net']:+.0f}**.")
     L.append("")
 
@@ -6719,7 +6810,10 @@ def build_snapshot(save_path, faction_template=None):
     mc_latent = extract_mc_latent_demand(gs, player_fid)
     mc_breakdown = extract_mc_full(gs, player_fid, hab_inv, factions,
                                    mining_cost=mc_latent['mine_network_cost'])
-    mc_breakdown['mc_nations'] = cp_data['earth_mc_by_faction'].get(faction_template, 0)
+    # Per-CP split of each nation's MC (the tooltip's "nations" line) — NOT the
+    # majority-nation total in cp_data['earth_mc_by_faction'], which over-reads for
+    # every partially-held nation (that total is still used for the untapped-MC table).
+    mc_breakdown['mc_nations'] = extract_nation_mc_share(gs, player_fid)
     cp_cap = extract_cp_cap(gs, player_fid, factions)
     leo_saturation = extract_leo_saturation(gs, player_fid)
     leo_slots = extract_leo_slot_capacity(gs, player_fid)
@@ -6765,6 +6859,59 @@ def build_snapshot(save_path, faction_template=None):
             research_income['total_per_day'] = round(base + dist, 2)
             research_income['total_per_month'] = round((base + dist) * 30.44, 1)
             research_income['total_per_year'] = round((base + dist) * 365.25, 1)
+    # Overlay the EXACT model (research_income.py: code-verified nation formula, org/trait
+    # councilor incomes, template-valued ControlPointResearch effects incl. scenario/mod
+    # layers, per-slot distribution bonus) on the heuristic breakdown above. The heuristic
+    # stays as the fallback when the templates mirror is missing.
+    faction_comparison = extract_faction_comparison(factions)
+    if research_income:
+        model = None
+        try:
+            import research_income as _ri   # lazy: research_income imports this module
+            sr = _ri.SaveResearch(gs=gs)
+            model = sr.breakdown(faction_template, with_mc=True)
+            # Live research for EVERY faction's comparison row (replaces the stale cache).
+            for row in faction_comparison:
+                if row['template'] == 'AlienCouncil':
+                    row['research_live_day'] = 0.0       # the aliens don't research
+                    continue
+                try:
+                    b = sr.breakdown(row['template'], with_mc=True)
+                    # Rivals: the ledger-anchored figure (their booked base × distribution) is
+                    # the game's own number; the formula is only its explanation. The player's
+                    # row uses the live model, which matches today's tooltip.
+                    row['research_live_day'] = (b['total_day'] if row['template'] == faction_template
+                                                else (b['ledger_total_day'] or b['total_day']))
+                except Exception:
+                    row['research_live_day'] = None
+        except Exception as ex:                      # templates missing, faction mismatch…
+            research_income['model_error'] = str(ex)
+        if model:
+            research_income.update({
+                'councilors_per_day_estimate': round(model['councilors_day'], 2),
+                'nation_cp_share_per_day': round(model['nations_day'], 2),
+                'advise_direct_per_day': 0.0,        # adviser Science is inside the nation formula
+                'nation_per_day_total': round(model['nations_day'], 2),
+                'habs_per_day': round(model['habs_day'], 2),
+                'habs_per_month': round(model['habs_day'] * 30.44, 1),
+                'unused_mc_per_day': round(model['unused_mc_day'], 2),
+                'base_sources_per_day': round(model['total_day'] / (1 + model['dist_pct']), 2),
+                'dist_bonus_pct': model['dist_pct'],
+                'dist_bonus_per_day': round(model['dist_day'], 2),
+                'total_per_day': round(model['total_day'], 2),
+                'total_per_month': round(model['total_month'], 1),
+                'total_per_year': round(model['total_day'] * 365.25, 1),
+                'is_estimated': False,
+                'model': 'exact',
+                'nation_contribs': [{
+                    'nation_template': r['template'], 'nation_name': r['name'],
+                    'cps_owned': r['my_cps'], 'total_cps': r['num_cps'],
+                    'share_pct': round(100.0 * r['my_cps'] / max(r['num_cps'], 1), 1),
+                    'monthly_research': round(r['research_month'], 1),
+                    'my_share_per_day': round(r['player_month'] * 12 / 365.2421875, 2),
+                } for r in model['nation_rows']],
+                'booked_ledger_per_day': model['booked_day'],
+            })
     rival_resources = extract_rival_resources(gs, factions, player_fid)
     unlockable_projects = extract_unlockable_projects(gs, player_fid, templates)
     chain = VICTORY_CHAINS.get(faction_template, [])
@@ -6792,7 +6939,7 @@ def build_snapshot(save_path, faction_template=None):
         'faction_name': FACTION_DISPLAY.get(faction_template, faction_template),
         'player_faction': player_faction,
         'templates': templates,
-        'faction_comparison': extract_faction_comparison(factions),
+        'faction_comparison': faction_comparison,
         'habs_by_faction': habs_by_faction,
         'fleet_by_faction': fleet_by_faction,
         'cps_by_faction': cps_by_faction,

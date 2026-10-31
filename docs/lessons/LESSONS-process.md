@@ -283,3 +283,38 @@ Helpers default to `"month"` when the key is absent, so it works for every campa
    the raw unit through.
 5. Terminology travels with this: use the localized in-game label, never the internal field name
    (say **"Funding"**, not "space funding"/`spaceFunding_year`; translate through localization).
+
+## P18 (2026-10-17; in-game 2006-07-16) — Game data is LAYERED: base + DLC scenario + mods. A template the mirror lacks reads as "no effect"
+
+The game does not load `StreamingAssets/Templates` alone. Dark Skies ships its scenarios as
+**template overlays** — `<install>/DLC_Content/DarkSkies/2003_Scenario/Templates/` (and
+`Broken_Earth_Scenario/`) — merged on top of the base per `dataName`, and every enabled mod
+(`<install>/Mods/Enabled/*/TI*Template.json`) is merged after that. A mirror built from the
+base folder alone is silently wrong for such a campaign, and the failure is **quiet**: the
+save references effect/tech/project names the mirror has never heard of, and every lookup
+falls back to a default ("Additive 0", "no effect", "unknown project").
+
+Worked case (2003-scenario save, Brutal, build 1.0.63): the faction carried
+`Effect_BS_CPResearchPenalty` (Multiplicative **×0.5** on ControlPointResearch) — defined ONLY
+in the 2003 overlay. `research_income.py` defaulted it to ×1.0 and read research 1,070/mo vs
+the tooltip's 813.6; the extractor's CP-cap stack (`Effect_BS_CPMaintenancePenalty` +40,
+`…MakingHistoryA` −60) was parsed from the digits in the names (0 / 0) instead of the template
+values; `BS_*` techs and `Project_BS_*` projects had no friendly names. Nothing errored.
+
+**Rules:**
+1. `sync_game_data.py` builds the mirror from the three layers (config `scenario` + `mods`;
+   `setup_campaign.py` detects the scenario from the `BS_`/`BSBE_` prefixes in the save's
+   research state). Provenance per file: `scripts/templates/_LAYERS.json`. Re-sync after a
+   patch AND after changing mods.
+2. When a reconstructed number disagrees with the game, the first suspect is a missing layer —
+   check `_LAYERS.json` and whether the save applies effect names the templates don't define.
+   `research_income.py` now WARNS on stderr for unknown ControlPointResearch effects; never
+   let an unknown effect default silently in new code — warn.
+3. Value effects from the template (`operation` + `value`), never from digits in the name
+   (`Effect_ControlPointMaintenanceBonus160` is −120; un-numbered effects are not 0).
+4. `TIGlobalConfig.json` (base and overlays) is JSON-with-comments (`//`, `/* */`) and a
+   single-dict file — merge it KEY-wise, never per-dataName (an overlay carries only the keys
+   it changes).
+5. Only template-file mods can be mirrored; `.dll` mods change code and stay unmodelled — list
+   them in the campaign notes so a persistent discrepancy can be attributed.
+Related: E25 (per-CP MC split), R29 (councilor research no longer scales with Science on 1.0.63).

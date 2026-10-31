@@ -122,7 +122,8 @@ def extract_point(save_path, faction_template=None, templates=None):
     try:
         cp_data = extract_control_points(gs, factions)
         point["cps"] = cp_data["by_faction"].get(faction_template, 0)
-        mc_nations = cp_data["earth_mc_by_faction"].get(faction_template, 0)
+        from extract_snapshot import extract_nation_mc_share
+        mc_nations = extract_nation_mc_share(gs, fid)   # per-CP split = the tooltip's nations line
     except Exception as e:  # pragma: no cover — old-save schema drift
         point["errors"].append(f"control_points: {e}")
         point["cps"] = len(fac.get("controlPoints", []) or [])

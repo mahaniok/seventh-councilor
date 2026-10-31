@@ -7,8 +7,8 @@ Usage:
         [--target 1000]
 
 Computes current MC available via extract_snapshot's calibrated four-source
-reconstruction (HQ + councilors + nations + POWERED positive-MC hab modules —
-reads ~7 MC optimistic on the nations term, lesson E25), then walks every
+reconstruction (HQ + councilors + nations as the per-CP split + POWERED positive-MC
+hab modules, lesson E25), then walks every
 pending positive-MC module by completionDate and prints:
   - monthly capacity-gain rollup with running capacity
   - the date capacity crosses --target (with the ±7 caveat)
@@ -74,8 +74,8 @@ def main():
     latent = extract_mc_latent_demand(gs, fid)
     mc = extract_mc_full(gs, fid, hab_inv, factions,
                          mining_cost=latent['mine_network_cost'])
-    cp = extract_control_points(gs, factions)
-    mc['mc_nations'] = cp['earth_mc_by_faction'].get(args.faction, 0)
+    from extract_snapshot import extract_nation_mc_share
+    mc['mc_nations'] = extract_nation_mc_share(gs, fid)   # per-CP split = the tooltip's nations line
     available = (mc['mc_hq'] + mc['mc_councilors'] + mc['mc_nations']
                  + mc['mc_hab_produced'])
     used = mc['mc_used_reported']
@@ -84,7 +84,7 @@ def main():
     if isinstance(game_date, tuple):
         game_date = game_date[0]
     print(f"Game date {game_date} — capacity {available:.0f} "
-          f"(reconstruction, ~7 optimistic; top bar is truth), used {used:.0f}, "
+          f"(reconstruction; top bar is truth), used {used:.0f}, "
           f"slack {available - used:+.0f}")
 
     mc_table = load_mc_table()
